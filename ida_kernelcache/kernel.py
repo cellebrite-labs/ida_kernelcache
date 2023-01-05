@@ -57,14 +57,22 @@ def parse_prelink_info():
         seg_end = idc.get_segm_end(segment)
 
         #prelink_info_string = idc.get_strlit_contents(segment)
-        prelink_info_string = idc.get_bytes(seg_start, seg_end-seg_start)
+        prelink_info_bytes: bytes = idc.get_bytes(seg_start, seg_end-seg_start)
+        prelink_info_string = None
 
-        if prelink_info_string[:5] != b"<dict":
+        if not prelink_info_bytes.startswith(b"<?xml") and not prelink_info_bytes.startswith(b"<dict>"):
+            _log(0, "skip prelink_info")
             continue
 
-        if prelink_info_string != None:
-            prelink_info_string = prelink_info_string.replace(b"\x00", b"")
-            prelink_info_string = prelink_info_string.decode()
+        if prelink_info_bytes != None:
+            prelink_info_bytes = prelink_info_bytes.replace(b"\x00", b"").replace(b"\x09", b"").replace(b"\x0A", b"")
+            prelink_info_string = prelink_info_bytes.decode()
+
+        start_tag = "<dict>"
+        end_tag = "</dict>"
+
+        prelink_info_string = prelink_info_string[prelink_info_string.index(start_tag):]
+        prelink_info_string = prelink_info_string[:prelink_info_string.rindex(end_tag) + len(end_tag)]
 
         prelink_info = kplist.kplist_parse(prelink_info_string)
         if prelink_info:

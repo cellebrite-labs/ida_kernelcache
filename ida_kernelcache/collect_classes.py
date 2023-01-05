@@ -185,7 +185,7 @@ def _process_mod_init_func_for_metaclasses(func, found_metaclass):
             return
         _log(5, 'Have call to {:#x}({:#x}, {:#x}, ?, {:#x})', addr, X0, X1, X3)
         # OSMetaClass::OSMetaClass(this, className, superclass, classSize)
-        if not (bool(re.match(".*__TEXT[.:]__cstring", idc.get_segm_name(X1)))) or not idc.get_segm_name(X0):
+        if not (bool(re.match(".*__cstring", idc.get_segm_name(X1)))) or not idc.get_segm_name(X0):
             return
         found_metaclass(X0, idc.get_strlit_contents(X1).decode(), X3, reg['X2'] or None)
     _emulate_arm64(func, idc.find_func_end(func), on_BL=on_BL)
@@ -198,7 +198,8 @@ def _process_mod_init_func_section_for_metaclasses(segstart, found_metaclass):
 
 def _should_process_segment(seg, segname):
     """Check if we should process the specified segment."""
-    return bool(re.match('.*__DATA(_CONST)?[.:]__mod_init_func', segname)) or bool(re.match('.*__DATA(_CONST)?[.:]__kmod_init', segname))
+    is_kernel_segname = segname == "com.apple.kernel:__mod_init_func"
+    return is_kernel_segname or bool(re.match('.*__DATA(_CONST)?[.:]__mod_init_func', segname)) or bool(re.match('.*__DATA(_CONST)?[.:]__kmod_init', segname))
 
 def _collect_metaclasses():
     """Collect OSMetaClass information from all kexts in the kernelcache."""
@@ -295,7 +296,7 @@ def _collect_vtables(metaclass_info):
     # Process all the segments with found_vtable().
     for ea in idautils.Segments():
         segname = idc.get_segm_name(ea)
-        if not bool(re.match('.*__DATA(_CONST)?[.:]__const', segname)):
+        if not bool(re.match('.*__const', segname)):
             continue
         _log(2, 'Processing segment {}', segname)
         _process_const_section_for_vtables(ea, metaclass_info, found_vtable)

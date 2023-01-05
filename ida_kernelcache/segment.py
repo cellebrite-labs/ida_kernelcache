@@ -124,7 +124,7 @@ def initialize_segments():
     for kext_prelink_info in prelink_info_dicts:
         kext = kext_prelink_info.get('CFBundleIdentifier', None)
         mach_header = kext_prelink_info.get('_PrelinkExecutableLoadAddr', None)
-        if kext is not None and mach_header is not None:
+        if kext is not None and mach_header is not None and mach_header != 0x7fffffffffffffff:
             orig_kext = idc.get_segm_name(mach_header).split(':', 1)[0]
             if '.kpi.' not in kext and orig_kext != kext:
                 _log(0, 'Renaming kext {} -> {}', orig_kext, kext)
