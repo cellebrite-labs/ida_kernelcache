@@ -11,7 +11,7 @@ import idc
 import idautils
 import idaapi
 
-from .symbol import vtable_symbol_for_class
+from .symbol import vtable_symbol_for_class, global_name
 from . import ida_utilities as idau
 from . import classes
 from . import stub
@@ -97,8 +97,10 @@ def vtable_length(ea, end=None, scan=False):
     # TODO: We should verify that all vtable entries refer to code.
     # Now we know that we have at least one nonzero value, our job is easier. Get the full length
     # of the vtable, including the first VTABLE_OFFSET entries and the subsequent nonzero entries,
-    # until either we find a zero word (not included) or run out of words in the stream.
-    length = VTABLE_OFFSET + 1 + idau.iterlen(takewhile(lambda word: word != 0, words))
+    # until either we find a zero word (not included), or an address which is not in the range of kernel addresses  or run out of words in the stream.
+    info = idaapi.get_inf_structure()
+    min_addr, max_addr = info.min_ea, info.max_ea
+    length = VTABLE_OFFSET + 1 + idau.iterlen(takewhile(lambda word: word != 0 and min_addr < word < max_addr, words))
     # Now it's simple: We are valid if the length is long enough, invalid if it's too short.
     return return_value(length >= MIN_VTABLE_LENGTH, length)
 
@@ -166,6 +168,11 @@ def initialize_vtable_symbols():
     classes.collect_class_info()
     for classname, classinfo in list(classes.class_info.items()):
         if classinfo.vtable:
+            if classinfo.superclass_name and classes.class_info[classinfo.superclass_name].vtable == classinfo.vtable:
+                _log(3, 'Class {} has the same vtable as its parent {} at: {:#x}', 
+                classname, classinfo.superclass_name, classinfo.vtable)
+                continue
+
             _log(3, 'Class {} has vtable at {:#x}', classname, classinfo.vtable)
             if not add_vtable_symbol(classinfo.vtable, classname):
                 _log(0, 'Could not add vtable symbol for class {} at address {:#x}', classname,
@@ -323,13 +330,9 @@ def class_vtable_overrides(classinfo, superinfo=None, new=False, methods=False):
     class_vtable = classinfo.vtable
     class_vlength = classinfo.vtable_length
     # Get the vtable for the superclass.
-    if superinfo:
+    if superinfo and superinfo.vtable:
         super_vtable = superinfo.vtable
         super_vlength = superinfo.vtable_length
-        if super_vlength is None:
-            super_vlength = 0  # TODO: theres a fix to apply where some classes vtable is not found because the vtable does not have the correct mangled name. Try on OSCOllection
-        if super_vtable is None:
-            super_vtable = 0  # TODO: theres a fix to apply where some classes vtable is not found because the vtable does not have the correct mangled name. Try on OSCOllection
         try:
             assert class_vlength >= super_vlength
         except AssertionError:
@@ -364,7 +367,9 @@ def _vtable_method_symbol_substitute_class(method_symbol, new_class, old_class=N
         if not old_class:
             return None
     old_class_part = '{}{}'.format(len(old_class), old_class)
-    new_class_part = '{}{}'.format(len(new_class), new_class)
+    #new_class_part = '{}{}'.format(len(new_class), new_class)
+    # TODO: this is a temp solution to have templated classes names resolved well. Need a permanent one.
+    new_class_part = global_name(new_class).replace("__ZN", "").replace("__Z", "") 
     if old_class_part not in method_symbol:
         return None
     return method_symbol.replace(old_class_part, new_class_part, 1)

@@ -5,6 +5,7 @@
 # The kernel module holds functions and global variables pertaining to the kernel as a whole. No
 # prior initialization via ida_kernelcache is necessary.
 #
+import plistlib
 
 import idc
 import idautils
@@ -58,17 +59,16 @@ def parse_prelink_info():
 
         #prelink_info_string = idc.get_strlit_contents(segment)
         prelink_info_string = idc.get_bytes(seg_start, seg_end-seg_start)
-
-        if prelink_info_string[:5] != b"<dict":
-            continue
-
         if prelink_info_string != None:
-            prelink_info_string = prelink_info_string.replace(b"\x00", b"")
-            prelink_info_string = prelink_info_string.decode()
+            if prelink_info_string[:5] == b"<dict":
+                prelink_info_string = prelink_info_string.replace(b"\x00", b"")
+                prelink_info_string = prelink_info_string.decode()
 
-        prelink_info = kplist.kplist_parse(prelink_info_string)
-        if prelink_info:
-            return prelink_info
+                prelink_info = kplist.kplist_parse(prelink_info_string)
+                if prelink_info:
+                    return prelink_info
+            elif prelink_info_string.startswith(b"<?xml version=\"1.0\""):
+                return plistlib.loads((prelink_info_string.rstrip(b"\x00")))
     _log(0, 'Could not find __PRELINK_INFO')
     return None
 

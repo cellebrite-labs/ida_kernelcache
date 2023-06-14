@@ -16,6 +16,7 @@ import ida_funcs
 import ida_name
 import ida_auto
 
+read_ptr = idaapi.get_qword if idaapi.get_inf_structure().is_64bit() else idaapi.get_dword
 
 def make_log(log_level, module):
     """Create a logging function."""
@@ -452,25 +453,35 @@ def null_terminated(string):
     """Extract the NULL-terminated C string from the given array of bytes."""
     return string.split(b'\0', 1)[0].decode()
 
+def _fix_unrecognized_function_insns(func):
+    # Undefine every instruction that IDA does not recognize within the function
+    while idc.find_func_end(func) == idc.BADADDR:
+        func_properties = ida_funcs.func_t(func)
+        ida_funcs.find_func_bounds(func_properties, ida_funcs.FIND_FUNC_DEFINE)
+        unrecognized_insn = func_properties.end_ea
+        if unrecognized_insn == 0:
+            _log(1, "Could not find unrecognized instructions for function at {:#x}", func)
+            return False
+
+        # We found an unrecognized instruction, lets undefine it and explicitly make an instruction out of it!
+        unrecognized_insn_end = ida_bytes.get_item_end(unrecognized_insn)
+        _log(1, 'Undefining item {:#x} - {:#x}', unrecognized_insn, unrecognized_insn_end)
+        ida_bytes.del_items(unrecognized_insn, ida_bytes.DELIT_EXPAND)
+        if idc.create_insn(unrecognized_insn) == 0:
+            _log(1, "Could not convert data at {:#x} to instruction", unrecognized_insn)
+            return False
+        
+    return True
+
 def _convert_address_to_function(func):
     """Convert an address that IDA has classified incorrectly into a proper function."""
     # If everything goes wrong, we'll try to restore this function.
     orig = idc.first_func_chunk(func)
-    # If the address is not code, let's undefine whatever it is.
-    if not ida_bytes.is_code(ida_bytes.get_full_flags(func)):
-        if not is_mapped(func):
-            # Well, that's awkward.
-            return False
-        item    = ida_bytes.get_item_head(func)
-        itemend = ida_bytes.get_item_end(func)
-        if item != idc.BADADDR:
-            _log(1, 'Undefining item {:#x} - {:#x}', item, itemend)
-            ida_bytes.del_items(item, ida_bytes.DELIT_EXPAND)
-            idc.create_insn(func)
-            # Give IDA a chance to analyze the new code or else we won't be able to create a
-            # function.
-            ida_auto.auto_wait()
-            idc.plan_and_wait(item, itemend)
+    if idc.find_func_end(func) == idc.BADADDR:
+        # Could not find function end, probably because IDA parsed an instruction 
+        # in the middle of the function incorrectly as data. Lets try to fix the relevant insns.
+        _fix_unrecognized_function_insns(func)
+
     else:
         # Just try removing the chunk from its current function. IDA can add it to another function
         # automatically, so make sure it's removed from all functions by doing it in loop until it

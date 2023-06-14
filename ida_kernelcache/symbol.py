@@ -132,13 +132,43 @@ def make_ident(name):
     return ident
 
 def _mangle_name(scopes):
+    def _is_templated_scope(scope: str):
+        # Detect simple template of one argument
+        return scope.count('<') == 1 and scope.count('>') == 1 and scope.index('<') < scope.index('>')
+
+    def _mangle_templated_scope(scope: str):
+        symbol = ""
+
+        before_template_start_sign, template_data, after_template_end_sign = re.split(r"[<,>]", scope)
+        if before_template_start_sign:
+            symbol += f"{len(before_template_start_sign)}{before_template_start_sign}"
+
+        symbol += "I"  # Start of template
+
+        # Handle pointers mangling of templated-classes
+        num_of_trailing_asterisks = len(template_data) - len(template_data.rstrip('*'))
+        template_data = template_data.rstrip('*')
+        symbol += "P" * num_of_trailing_asterisks
+
+        symbol += f"{len(template_data)}{template_data}"
+        symbol += "E"  # End of template
+
+        if after_template_end_sign:
+            symbol += f"{len(after_template_end_sign)}{after_template_end_sign}"
+
+        return symbol
+
     symbol = ''
     if len(scopes) > 1:
         symbol += 'N'
     for name in scopes:
         if len(name) == 0:
             return None
-        symbol += '{}{}'.format(len(name), name)
+        if _is_templated_scope(name):
+            symbol += _mangle_templated_scope(name)
+        else:
+            symbol += f"{len(name)}{name}"
+
     if len(scopes) > 1:
         symbol += 'E'
     return symbol
@@ -181,3 +211,10 @@ def global_name(name):
         return None
     return '__Z' + mangled
 
+
+def clean_templated_name(templated_name):
+    # TODO: below is a hack fix to handle names of templates. We need a better way to handle them.
+    # example "OSValueObject<void*>" -> "OSValueObject_voidP_"
+    # also: iOS17b1 OSValueObject<OSKextRequestResourceCallback>::fields field on the struct: OSValueObject<OSKextRequestResourceCallback>
+    clean_name = templated_name.replace("<", "_").replace(">", "_").replace("*", "P")
+    return clean_name

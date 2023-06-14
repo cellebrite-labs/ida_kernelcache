@@ -23,7 +23,7 @@ def make_name_generator(suffix, max_count=999999):
             if idau.get_name_ea(new_name) == idc.BADADDR:
                 next_index_dict[name] = index
                 return new_name
-        new_index_dict[name] = max_count
+        next_index_dict[name] = max_count
         return None
     return get_next
 
