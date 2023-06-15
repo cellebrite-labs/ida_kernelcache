@@ -2,7 +2,7 @@
 
 ## Cellebrite Fork
 
-This fork was updated to work on IDA8.0/Python3/iOS 15.5
+This fork was updated to work on IDA8.3/Python3/iOS 17.0b1
 
 ## Original Readme
 <!-- Brandon Azad -->

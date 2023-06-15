@@ -60,7 +60,7 @@ There are advantages and disadvantages to each representation. The unions repres
 more flexible if the automated analysis messes up, but so far I have not found a good way to set
 the operands of instructions referring to these structures.
 
-TODO: I know it's probably possible with idaapi.op_stroff().
+TODO: I know it's probably possible with ida_bytes.op_stroff().
 
 We divide the processing into two parts: vtable generation and class generation.
 
@@ -186,10 +186,12 @@ def _populate_vtable_struct(sid, classinfo):
         if vmethods_sid is None:
             _log(0, 'Could not find {}::vmethods', ci.classname)
             return False
+
+        clean_name = symbol.clean_templated_name(ci.classname)
         # Add this ::vmethods slice to the ::vtable struct.
-        ret = idau.struct_add_struct(sid, ci.classname, offset, vmethods_sid)
+        ret = idau.struct_add_struct(sid, clean_name, offset, vmethods_sid)
         if ret != 0:
-            _log(0, 'Could not add {}::vmethods to {}::vtable', ci.classname, classinfo.classname)
+            _log(0, 'Could not add {}::vmethods to {}::vtable errno:{}', clean_name, classinfo.classname, ret)
             return False
     return True
 
@@ -225,8 +227,9 @@ def _create_class_structs__slices(classinfo, endmarkers=True):
     # Open or create the structs.
     sidf = idau.struct_open(classname + '::fields', create=True)
     
-    # Now IDA creates structs that collide with the names that we want to use.
+    # IDA is getting smart, it creates structs that collide with the names that we want to use.
     # For now, we'll try to rename what IDA created. Other alternatives are deleting it or removing the fields.
+    # All this until one day, IDA will do a decent job and we won't need this script. :)
     sid = idau.struct_open(classname)
     if (sid):
         _log(1, f'IDA has already created {classname} struct, renaming it.')
@@ -288,10 +291,12 @@ def _populate_wrapper_struct__slices(sid, classinfo):
         # STRUC_ERROR_MEMBER_VARLAST errors.
         if idc.get_member_offset(sid, ci.classname) != -1:
             continue
-        # Add the ::fields struct to the wrapper.
-        ret = idau.struct_add_struct(sid, ci.classname, offset, fields_sid)
+        # TODO: this is a temp solution to have templated classes names resolved well. Need a permanent one.
+        # example: iOS17b1 OSValueObject<OSKextRequestResourceCallback>::fields field on the struct: OSValueObject<OSKextRequestResourceCallback>
+        clean_name = symbol.clean_templated_name(ci.classname)  
+        ret = idau.struct_add_struct(sid, clean_name, offset, fields_sid)
         if ret != 0:
-            _log(0, 'Could not create {}.{}: {}', classinfo.classname, ci.classname, ret)
+            _log(0, '_populate_wrapper_struct__slices:For sid: {} and msid: {} Could not create {}.{}: {}', sid, fields_sid, classinfo.classname, clean_name, ret)
             return False
         offset += size
     return True
@@ -341,7 +346,7 @@ def _populate_wrapper_struct__unions(sid, classinfo):
         # struct has length 0.
         ret = idau.struct_add_struct(sid, ci.classname, -1, fields_sid)
         if ret not in (0, idc.STRUC_ERROR_MEMBER_NAME, idc.STRUC_ERROR_MEMBER_UNIVAR):
-            _log(0, 'Could not create {}.{}: {}', classinfo.classname, ci.classname, ret)
+            _log(0, '_populate_wrapper_struct__unions: For sid: {} and msid: {} Could not create {}.{}: {}', sid, fields_sid, classinfo.classname, ci.classname, ret)
             return False
     return True
 

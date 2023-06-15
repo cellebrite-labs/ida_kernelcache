@@ -6,7 +6,9 @@
 # necessary.
 #
 
+import re
 import idc
+from ida_segment import SEGPERM_READ, SEGPERM_WRITE, SEGPERM_EXEC
 
 from . import ida_utilities as idau
 from . import kernel
@@ -19,6 +21,37 @@ idc.import_type(-1, 'segment_command_64')
 idc.import_type(-1, 'section_64')
 
 _LC_SEGMENT_64 = 0x19
+
+
+def _segments():
+    seg_ea = idc.get_first_seg()
+    while seg_ea != idc.BADADDR:
+        name = idc.get_segm_name(seg_ea)
+        yield seg_ea, name
+        seg_ea = idc.get_next_seg(seg_ea)
+
+def _fix_kernel_segments():
+    for seg_off, seg_name in _segments():
+        perms = None
+        seg_name = seg_name.strip()
+       
+        if re.match(r".*[_.](got|const|cstring)$", seg_name, re.I):
+            _log(1, "rw " + seg_name)
+            perms = SEGPERM_READ | SEGPERM_WRITE
+        elif re.match(r".*[_.](text|func|stubs)$", seg_name, re.I):
+            _log(1, "rx " + seg_name)
+            perms = SEGPERM_READ | SEGPERM_EXEC
+        elif re.match(r".*[_.](data)$", seg_name, re.I):
+            _log(1, "rw " + seg_name)
+            perms = SEGPERM_READ | SEGPERM_WRITE
+
+        if perms is not None:
+            idc.set_segm_attr(seg_off, idc.SEGATTR_PERM, perms)
+
+
+def _convert_list_to_bytes(l):
+    return bytes(l) if type(l) is list else l
+    
 
 def _macho_segments_and_sections(ea):
     """A generator to iterate through a Mach-O file's segments and sections.
@@ -34,14 +67,14 @@ def _macho_segments_and_sections(ea):
         loadcmd = idau.read_struct(lc, 'load_command', asobject=True)
         if loadcmd.cmd == _LC_SEGMENT_64:
             segcmd = idau.read_struct(lc, 'segment_command_64', asobject=True)
-            segname  = idau.null_terminated(segcmd.segname)
+            segname  = idau.null_terminated(_convert_list_to_bytes(segcmd.segname))
             segstart = segcmd.vmaddr
             segend   = segstart + segcmd.vmsize
             sects    = []
             sc  = int(segcmd) + len(segcmd)
             for i in range(segcmd.nsects):
                 sect = idau.read_struct(sc, 'section_64', asobject=True)
-                sectname  = idau.null_terminated(sect.sectname)
+                sectname  = idau.null_terminated(_convert_list_to_bytes(sect.sectname))
                 sectstart = sect.addr
                 sectend   = sectstart + sect.size
                 sects.append((sectname, sectstart, sectend))
@@ -113,7 +146,11 @@ def initialize_segments():
     the bundle identifier if the segment is part of a kernel extension. The special region
     containing the Mach-O header is renamed '[<kext>:]<segment>.HEADER'.
     """
-    # First rename the kernel segments.
+    # First fix kernel segments permissions
+    _log(1, 'Fixing kernel segments permissions')
+    _fix_kernel_segments()
+
+    # Rename the kernel segments.
     _log(1, 'Renaming kernel segments')
     kernel_skip = ['__PRELINK_TEXT', '__PLK_TEXT_EXEC', '__PRELINK_DATA', '__PLK_DATA_CONST']
     _initialize_segments_in_kext(None, kernel.base, skip=kernel_skip)
@@ -126,6 +163,8 @@ def initialize_segments():
         mach_header = kext_prelink_info.get('_PrelinkExecutableLoadAddr', None)
         if kext is not None and mach_header is not None:
             orig_kext = idc.get_segm_name(mach_header).split(':', 1)[0]
+            if not orig_kext:  # TODO: check if mach_header is valid
+                continue
             if '.kpi.' not in kext and orig_kext != kext:
                 _log(0, 'Renaming kext {} -> {}', orig_kext, kext)
             _log(1, 'Renaming segments in {}', kext)
