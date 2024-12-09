@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ida-kernelcache"
+version = "1.0.0"
+authors = [
+    { name = "gilbo", email = "" },
+    { name = "Brandon Azad", email = "bazad@cs.stanford.edu" },
+]
+description = "IDA Plugin to aid with iOS kernelcache reversing"
+readme = "README.md"
+dynamic = ["dependencies"]
+requires-python = ">= 3.8"
+
+[project.urls]
+Repository = "https://github.com/g0x69lbo/ida_kernelcache"
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }

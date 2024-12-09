@@ -1,14 +1,17 @@
 import idc
 import idaapi
 import idautils
-import ida_kernelcache.ida_utilities as idau
+import logging
+
+import ida_kernelcache.ida_helpers as ida_helpers
+import ida_kernelcache.ida_helpers.generators as generators
 
 # IDK where IDA defines these.
 _MEMOP_PREINDEX = 0x20
 _MEMOP_POSTINDEX = 0x80
 _MEMOP_WBINDEX = _MEMOP_PREINDEX | _MEMOP_POSTINDEX
 
-_log = idau.make_log(2, __name__)
+log = logging.getLogger(__name__)
 
 
 class _Regs(object):
@@ -80,14 +83,14 @@ def emulate_arm64(start, end, on_BL=None, on_RET=None):
             size = 4
         else:
             return None
-        return idau.read_word(addr, size)
+        return ida_helpers.read_word(addr, size)
 
     def cleartemps():
         for t in ['X{}'.format(i) for i in range(0, 19)]:
             reg.clear(t)
 
-    for insn in idau.Instructions(start, end):
-        _log(11, 'Processing instruction {:#x}', insn.ea)
+    for insn in generators.Instructions(start, end):
+        log.debug(f'Processing instruction {insn.ea:#x}')
         mnem = insn.get_canon_mnem()
         if mnem == 'ADRP' or mnem == 'ADR' or mnem == 'ADRL':
             reg[insn.Op1.reg] = insn.Op2.value
@@ -129,5 +132,5 @@ def emulate_arm64(start, end, on_BL=None, on_RET=None):
                 on_BL(insn.Op1.addr, reg)
             cleartemps()
         else:
-            _log(10, 'Unrecognized instruction at address {:#x}', insn.ea)
+            log.debug(f'Unrecognized instruction at address {insn.ea:#x}')
             reg.clearall()

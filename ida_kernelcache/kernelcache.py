@@ -1,38 +1,51 @@
 import plistlib
-from typing import List
+import re
 
 import ida_auto
+import ida_segment
 import idaapi
-import idautils
 import idc
-
+import logging
 from ida_kernelcache import (
-    ida_utilities as idau,
-    kplist,
+    kplist, class_info,
 )
-from ida_kernelcache.consts import KCFormat
 from ida_kernelcache.exceptions import PhaseException
-from ida_kernelcache.phases import *
+from ida_kernelcache.phases.base_phase import BasePhase
+from ida_kernelcache.phases.collect_classes import CollectClasses
+from ida_kernelcache.ida_helpers.abstractions import Segment
 
-_log = idau.make_log(0, __name__)
-
+logging.basicConfig(format='%(levelname)-10s %(name)s: %(message)s', level=logging.INFO)
+log = logging.getLogger(__name__)
 
 
 class KernelCache(object):
+    """
+    I have the assumption that we are always interested in the latest kernelcaches. There isn't much sense in putting
+    effort to support old iOS releases. Hopefully we can be satisfied with just supporting that latest iOS major.
+    This will not attempt to have any backwards compatibility.
+    As long as this project is maintained, Hopefully this class will remain up to date with iOS ker
+
+    Current kernelcaches are delivered as a Mach-O FILESET. IDA 9.0 seems to handle the LC_FILESET_ENTRY load command
+    well enough, and it also parses inner Mach-O header of each Kext.
+    The current kernelcache I'm working on has 311 kexts and after loading it into IDA we get a total of *4301* segments
+    """
+
+    ALL_PHASES = [
+        CollectClasses
+    ]
 
     def __init__(self):
         super().__init__()
         self._base = None
         self._prelink_info = None
-        self.format = KCFormat.MERGED_12
 
-        # TODO: type annotations!
-        self.classes = {}  # A global map from class names to ClassInfo objects. See collect_class_info().
-        self.vtables = {}  # A global map from the address each virtual method tables in the kernelcache to its length.
+        self.class_info_map = class_info.ClassInfoMap()
+        # TODO: make this persistent?
+        self.segments_list: list[Segment] = []
 
-        # Once upon a time every KEXT had it's GOT ...
-        if any(idc.get_segm_name(seg).endswith("__got") for seg in idautils.Segments()):
-            self.format = KCFormat.NORMAL_11
+        for i in range(ida_segment.get_segm_qty()):
+            swig_segment = ida_segment.getnseg(i)
+            self.segments_list.append(Segment(swig_segment))
 
     @property
     def base(self):
@@ -50,26 +63,6 @@ class KernelCache(object):
 
         return self._base
 
-    @staticmethod
-    def _find_prelink_info_segments():
-        """Find all candidate __PRELINK_INFO segments (or sections).
-
-        We try to identify any IDA segments with __PRELINK_INFO in the name so that this function will
-        work both before and after automatic rename. A more reliable method would be parsing the
-        Mach-O.
-        """
-        segments = []
-        # Gather a list of all the possible segments.
-        for seg in idautils.Segments():
-            name = idc.get_segm_name(seg)
-            if '__PRELINK_INFO' in name or name == '__info':
-                segments.append(seg)
-        if len(segments) < 1:
-            _log(0, 'Could not find any __PRELINK_INFO segment candidates')
-        elif len(segments) > 1:
-            _log(1, 'Multiple segment names contain __PRELINK_INFO: {}', [idc.get_segm_name(seg) for seg in segments])
-        return segments
-
     @property
     def prelink_info(self):
         """
@@ -77,44 +70,57 @@ class KernelCache(object):
         """
         if self._prelink_info is None:
 
-            segments = self._find_prelink_info_segments()
+            # Find all candidate __PRELINK_INFO segments (or sections).
+            # We try to identify any IDA segments with __PRELINK_INFO in the name so that this function will
+            # work both before and after automatic rename. A more reliable method would be parsing the Mach-O.
+            try:
+                prelink_segment = next(s for s in self.segments_list if '__PRELINK_INFO' in s.name)
+            except StopIteration:
+                log.error('Could not find any __PRELINK_INFO segment candidates')
+                return None
 
-            for segment in segments:
-                seg_start = idc.get_segm_start(segment)
-                seg_end = idc.get_segm_end(segment)
+            prelink_info_string = idc.get_bytes(prelink_segment.start_ea, prelink_segment.size)
+            if prelink_info_string != None:
+                if prelink_info_string[:5] == b"<dict":
+                    prelink_info_string = prelink_info_string.replace(b"\x00", b"")
+                    prelink_info_string = prelink_info_string.decode()
+                    self._prelink_info = kplist.kplist_parse(prelink_info_string)
+                elif prelink_info_string.startswith(b"<?xml version=\"1.0\""):
+                    self._prelink_info = plistlib.loads((prelink_info_string.rstrip(b"\x00")))
 
-                # prelink_info_string = idc.get_strlit_contents(segment)
-                prelink_info_string = idc.get_bytes(seg_start, seg_end - seg_start)
-                if prelink_info_string != None:
-                    if prelink_info_string[:5] == b"<dict":
-                        prelink_info_string = prelink_info_string.replace(b"\x00", b"")
-                        prelink_info_string = prelink_info_string.decode()
-                        self._prelink_info = kplist.kplist_parse(prelink_info_string)
-                    elif prelink_info_string.startswith(b"<?xml version=\"1.0\""):
-                        self._prelink_info = plistlib.loads((prelink_info_string.rstrip(b"\x00")))
-
-            # Still None?
             if self._prelink_info is None:
-                _log(0, 'Could not find __PRELINK_INFO')
+                log.error('Failed to parse __PRELINK_INFO')
+
         return self._prelink_info
 
-    @staticmethod
-    def _check_filetype():
+    def segments_matching(self, pattern: str) -> tuple[Segment, None, None]:
+        for s in self.segments_list:
+            if re.match(pattern, s.name, flags=re.IGNORECASE):
+                yield s
+
+    def all_kexts(self) -> list[str]:
+        if not self.prelink_info:
+            return []
+        return [k['CFBundleIdentifier'] for k in self.prelink_info['_PrelinkInfoDictionary']]
+
+    @classmethod
+    def is_input_file_kernelcache(cls) -> bool:
+        """
+        Checks that the filetype is compatible before trying to process it.
+        """
         filetype = idaapi.get_file_type_name()
-        """Checks that the filetype is compatible before trying to process it."""
         return ('Mach-O' in filetype or 'kernelcache' in filetype) and 'ARM64' in filetype
 
-    def all_phases(self):
+    def all_phases(self) -> list[BasePhase]:
         phases = []
-        if self.format == KCFormat.MERGED_12 and idaapi.IDA_SDK_VERSION < 720:
-            phases.append(TaggedPointers)
-
+        # if self.format == KCFormat.MERGED_12 and idaapi.IDA_SDK_VERSION < 720:
+        #     phases.append(TaggedPointers)  # Not needed anymore since IDA 7.2 https://hex-rays.com/products/ida/news/7_2/
+        # RenamSegments,  # Not needed after IDA 7.5SP2? https://hex-rays.com/products/ida/news/7_5sp2/
         phases += [
-            RenameSegments,
             CollectClasses,
-            CollectVtables,
-            AddVtableSymbols,
-            AddMetaClassSymbols
+            # CollectVtables,
+            # AddVtableSymbols,
+            # AddMetaClassSymbols
         ]
 
         return phases
@@ -154,15 +160,11 @@ class KernelCache(object):
         # print('Initializing class structs')
         # class_struct.initialize_class_structs()
 
-    def process(self, phases: List = None):
+    def process(self, phases: list = None):
         """
         Process the kernelcache in IDA for the first time.
 
          This function performs all the standard processing available in this module:
-             * Convert iOS 12's new static tagged pointers into normal kernel pointers.
-             * Parse the kernel's `__PRELINK_INFO.__info` section into a dictionary.
-             * Renames segments in IDA according to the names from the __PRELINK_INFO dictionary (split
-               kext format kernelcaches only).
              * Converts pointers in data segments into offsets.
              * Locates virtual method tables, converts them to offsets, and adds vtable symbols.
              * Locates OSMetaClass instances for top-level classes and adds OSMetaClass symbols.
@@ -170,20 +172,27 @@ class KernelCache(object):
              * Symbolicates methods in vtables based on the method names in superclasses.
              * Creates IDA structs representing the C++ classes in the kernel.
          """
-        if not self._check_filetype():
-            _log(-1, f'Unsupported file type! This script supports ARM64 kernelcaches only!"')
+        if not self.is_input_file_kernelcache():
+            log.error(f'Unsupported file type! This script supports ARM64 kernelcaches only!"')
             return
+
+        log.info('processing kernelcache..')
+        if not phases:
+            phases = self.ALL_PHASES
 
         # Run all phases
         for phase_cls in phases:
+            log.info(f'***** Starting phase: {phase_cls.__name__} *****')
             phase = phase_cls(self)
 
             try:
                 phase.run()
             except PhaseException as ex:
                 if True:
-                    _log(-1, ex)
+                    log.exception(ex)
                 raise
+            else:
+                log.info(f'***** Finished phase: {phase_cls.__name__} *****')
 
             # auto-analyze after every phase
             ida_auto.auto_wait()

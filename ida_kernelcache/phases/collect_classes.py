@@ -1,9 +1,10 @@
 """
-ida_kernelcache/collect_classes.py
-Author: Brandon Azad
-Collects information about C++ classes in a kernelcache.
-"""
+Useful references:
 
+- https://developer.apple.com/documentation/kernel/osmetaclassbase
+- https://developer.apple.com/library/archive/documentation/DeviceDrivers/Conceptual/WritingDeviceDriver/CPluPlusRuntime/CPlusPlusRuntime.html
+"""
+import collections
 import re
 
 import idc
@@ -11,13 +12,15 @@ import idautils
 import ida_xref
 import ida_hexrays
 
-from ida_kernelcache import ida_utilities as idau
-from ida_kernelcache import class_info
-from ida_kernelcache.emulate import emulate_arm64
-
 from .base_phase import BasePhase
+from ida_kernelcache import class_info, symbol
 from ida_kernelcache.exceptions import PhaseException
 from ida_kernelcache.utils import OneToOneMapFactory
+
+import ida_kernelcache.ida_helpers.decompiler as decompiler
+import ida_kernelcache.ida_helpers.names as names
+import ida_kernelcache.ida_helpers as ida_helpers
+from ..consts import OSMETACLASS_CTOR_SYMBOL
 
 
 class CollectClasses(BasePhase):
@@ -37,192 +40,217 @@ class CollectClasses(BasePhase):
 
     Only Arm64 is supported at this time.
 
-    TODO: what are nested classes?
+    TODO: An example to a nested class that is interesting and we are missing ..?
     Only top-level classes are processed. Information about nested classes is not collected.
     """
+
+    NUM_EXPECTED_ARGS = 4
 
     def __init__(self, kc):
         super().__init__(kc)
 
+        self.osmetaclass_constructor_ea: int
         # Collect associations from class names to metaclass instances and vice versa.
+
         self._metaclass_to_classname_builder = OneToOneMapFactory()
         self._metaclass_to_class_size = {}
-        self._metaclass_to_meta_superclass = {}
-        self._metaclass_info = {}
+        self._metaclass_to_super_metaclass = {}
+        self._visited: set[int] = set()
+        self._var_expr_errors = collections.defaultdict(set)
+
+        # Statistics
+        self._num_xrefs = 0
+        self._num_failed = 0
+        self._num_succeeded = 0
+        self._num_duplicates = 0
+        self._num_unique_unresolved = 0
 
     def run(self):
         # Clear out old class information
-        self._kc.classes.clear()
-
-        self.log(1, 'Collecting information about OSMetaClass instances')
+        self._kc.class_info_map.clear()
+        self._find_osmetaclass_constructor()
         self._collect_metaclasses()
-        if not self._metaclass_info:
-            raise PhaseException('Failed collecting OSMetaClass instances')
 
-        self._kc.classes = self._metaclass_info.copy()
+        # Filter out any class name (and its associated metaclasses) that has multiple metaclasses.
+        # This can happen when multiple kexts define a class but only one gets loaded.
+        def bad_classname(classname, metaclasses):
+            self.log.warning(f'Class {classname} has multiple metaclasses: {", ".join(["{:#x}".format(mc) for mc in metaclasses])}')
 
-    def _found_metaclass(self, metaclass, classname, class_size, meta_superclass):
+        # Filter out any metaclass (and its associated class names) that has multiple class names. I
+        # have no idea why this would happen.
+        def bad_metaclass(metaclass, classnames):
+            self.log.warning(f'Metaclass {metaclass:#x} has multiple classes: {", ".join(classnames)}')
 
-        # to handle names like (iOS17b1): "OSValueObject<H10ISP::client_log_buffer_t>"
-        # TODO: handle in a better way
-        prob_pattern = r"<(.*?)::(.*?)>"
-        if re.search(prob_pattern, classname):
-            # replaces the "::" by "_"
-            classname = re.sub(prob_pattern, r"<\1_\2>", classname)
+        # Return the final dictionary of metaclass info.
+        metaclass_to_classname = self._metaclass_to_classname_builder.build(bad_metaclass, bad_classname)
+        for metaclass_ea, classname in metaclass_to_classname.items():
+            meta_superclass = self._metaclass_to_super_metaclass[metaclass_ea]
+            superclass_name = metaclass_to_classname.get(meta_superclass, None)
+            info = class_info.ClassInfo(classname,
+                                        metaclass_ea,
+                                        self._metaclass_to_class_size[metaclass_ea],
+                                        superclass_name,
+                                        meta_superclass)
+            self._kc.class_info_map.add_classinfo(info)
 
-        self._metaclass_to_classname_builder.add_link(metaclass, classname)
-        self._metaclass_to_class_size[metaclass] = class_size
-        self._metaclass_to_meta_superclass[metaclass] = meta_superclass
+        for classname_str, errors_ea_set in self._var_expr_errors.items():
+            if classname_str in self._kc.class_info_map:
+                # Don't consider those as failures in the statistics because we got the class info from somewhere else
+                self._num_failed -= len(errors_ea_set)
+                self._num_duplicates += len(errors_ea_set)
+            else:
+                self.log.error(f'Unresolved {classname_str}: {", ".join(f"{ea:#x}" for ea in errors_ea_set)}')
+                self._num_unique_unresolved += 1
+
+        # Print statistics
+        self.log.info(f'\n\ttotal:{self._num_xrefs} xrefs in {len(self._visited)} unique functions\n\t'
+                      f'succeeded:{self._num_succeeded}\n\t'
+                      f'failed:{self._num_failed} xrefs, a total of {self._num_unique_unresolved} unresolved classes\n\t'
+                      f'duplicates:{self._num_duplicates}\n\t')
+
+    def _find_osmetaclass_constructor(self):
+        """
+        Locate OSMetaClass::OSMetaClass function. We do this by finding the first reference to the OSObject string
+        """
+        try:
+            OSObject_str = next(s for s in idautils.Strings() if str(s) == "OSObject")
+        except StopIteration:
+            raise PhaseException("Couldn't find OSObject str")
+
+        # Surprisingly this hack works.. the first dref is the OSMetaClass::OSMetaClass constructor we are looking for
+        OSObject_xref = ida_xref.get_first_dref_to(OSObject_str.ea)
+
+        # Decompile the method using hexrays
+        cfunc = ida_hexrays.decompile(OSObject_xref)
+        if cfunc is None:
+            raise PhaseException("hexrays decompilation failed! did IDA finish processing the kernel yet?")
+
+        visitor = decompiler.FindCallByArgVisitor(OSObject_str.ea)
+        visitor.apply_to(cfunc.body, parent=None)
+
+        if not visitor.found:
+            raise PhaseException("Failed to find OSMetaclass::OSMetaclass ea!")
+
+        self.osmetaclass_constructor_ea = visitor.func_ea
+        self.log.info(f'Found OSMetaClass::OSMetaClass {self.osmetaclass_constructor_ea:#x}')
+        names.set_ea_name(self.osmetaclass_constructor_ea, OSMETACLASS_CTOR_SYMBOL)
+
+    def _find_osmetaclass_constructor_with_zone(self):
+        try:
+            IOSurface_str = next(s for s in idautils.Strings() if str(s) == "IOSurface")
+        except StopIteration:
+            raise PhaseException("Couldn't find OSObject str")
+
+        visitor = decompiler.FindCallByArgVisitor(IOSurface_str.ea)
+
+        for xref_ea in idautils.DataRefsTo(IOSurface_str.ea):
+            func_start_ea = ida_helpers.get_func_start(xref_ea)
+
+            # Decompile the method using hexrays
+            cfunc = ida_hexrays.decompile(func_start_ea)
+            if cfunc is None:
+                raise PhaseException("hexrays decompilation failed! did IDA finish processing the kernel yet?")
+            visitor.apply_to(cfunc.body, parent=None)
+
+        if not visitor.found:
+            raise PhaseException("Failed to find OSMetaclass::OSMetaclass ea!")
+
+        self.osmetaclass_constructor_ea = visitor.func_ea
+        self.log.info(f'Found OSMetaClass::OSMetaClass {self.osmetaclass_constructor_ea:#x}')
+        names.set_ea_name(self.osmetaclass_constructor_ea, OSMETACLASS_CTOR_SYMBOL)
 
     def _collect_metaclasses(self):
         """
         Collect OSMetaClass information from all kexts in the kernelcache.
         """
         old = idc.batch(1)
+
         try:
-            self._collect_metaclasses_by_ctor_xrefs()
+            # There are ~300 data refs in __auth_got segments however they do not seem to be used at all so I intentionally
+            # choose to skip them.
+            for xref_ea in idautils.CodeRefsTo(self.osmetaclass_constructor_ea, flow=False):
+                self._num_xrefs += 1
+                func_start_ea = ida_helpers.get_func_start(xref_ea)
+                self._visited.add(func_start_ea)
+                if self._handle_callsite(xref_ea):
+                    self._num_succeeded += 1
+                else:
+                    self._num_failed += 1
+
         finally:
             idc.batch(old)
 
-        self._collect_metaclasses_from_init_func_sections()
+    def _handle_callsite(self, ea: int, must_find_call: bool = True) -> bool:
+        args_ops = [
+            (ida_hexrays.cot_cast, ida_hexrays.cot_ref, ida_hexrays.cot_var),
+            (ida_hexrays.cot_obj,),
+            (ida_hexrays.cot_cast, ida_hexrays.cot_ref, ida_hexrays.cot_num),
+            (ida_hexrays.cot_num,)
+        ]
 
-        # Filter out any class name (and its associated metaclasses) that has multiple metaclasses.
-        # This can happen when multiple kexts define a class but only one gets loaded.
-        def bad_classname(classname, metaclasses):
-            self.log(0, 'Class {} has multiple metaclasses: {}', classname,
-                 ', '.join(['{:#x}'.format(mc) for mc in metaclasses]))
-
-        # Filter out any metaclass (and its associated class names) that has multiple class names. I
-        # have no idea why this would happen.
-        def bad_metaclass(metaclass, classnames):
-            self.log(0, 'Metaclass {:#x} has multiple classes: {}', metaclass, ', '.join(classnames))
-
-        # Return the final dictionary of metaclass info.
-        metaclass_to_classname = self._metaclass_to_classname_builder.build(bad_metaclass, bad_classname)
-        for metaclass, classname in metaclass_to_classname.items():
-            meta_superclass = self._metaclass_to_meta_superclass[metaclass]
-            superclass_name = metaclass_to_classname.get(meta_superclass, None)
-            self._metaclass_info[metaclass] = class_info.ClassInfo(classname, metaclass, None, None,
-                                                                   self._metaclass_to_class_size[metaclass],
-                                                                   superclass_name,
-                                                                   meta_superclass)
-
-    def _collect_metaclasses_by_ctor_xrefs(self):
-        """
-        """
-        OSObject_str = next(s for s in idautils.Strings() if str(s) == "OSObject")
-        if not OSObject_str:
-            raise PhaseException("Couldn't find OSObject str")
-
-        OSObject_xref = ida_xref.get_first_dref_to(OSObject_str.ea)
-
-        # Decompile the method using hexrays
-        cfunc = ida_hexrays.decompile(OSObject_xref)
-        if cfunc is None:
-            raise PhaseException("cfunc not found, did IDA finish processing the kernel yet? Let it finish and retry.")
-
-        call_insn = get_call_from_insn(cfunc.get_eamap()[OSObject_xref][0])
-        if not call_insn or call_insn.a[1].obj_ea != OSObject_str.ea:
-            raise PhaseException("Param 1 isnt obj_ea")
-
-        OSMetaClass_ctor = call_insn.x.obj_ea
-        for xref in idautils.XrefsTo(OSMetaClass_ctor):
-            # TODO: this used to be in try...except, why though?
-            self.parse_OSMetaClass_ctor_xref(xref.frm)
-
-    def parse_OSMetaClass_ctor_xref(self, ea):
+        visitor = decompiler.FindCallVisitor(self.osmetaclass_constructor_ea, ea, args_ops)
         cfunc = ida_hexrays.decompile(ea)
-        call_insn = get_call_from_insn(cfunc.get_eamap()[ea][0])
-        if not call_insn:
-            return
-        metaclass = dref_cast_and_ref_to_obj(call_insn.a[0])
-        classname_ea = dref_cast_and_ref_to_obj(call_insn.a[1])
-        super_metaclass = dref_cast_and_ref_to_obj(call_insn.a[2], dref_obj=True) or 0
-        class_size_arg = call_insn.a[3]
-        if not (metaclass and classname_ea and class_size_arg.op == ida_hexrays.cot_num):
-            return
-        if re.match(".*__cstring", idc.get_segm_name(classname_ea)) and idc.get_segm_name(metaclass):
-            self._found_metaclass(metaclass,
-                                  idc.get_strlit_contents(classname_ea).decode(),
-                                  class_size_arg.numval(),
-                                  super_metaclass)
+        if cfunc is None:
+            self.log.error(f'hexrays decompilation failed at {ea:#x}')
+            return False
 
-    def _collect_metaclasses_from_init_func_sections(self):
-        """
-        Process a __mod_init_func section for OSMetaClass information.
-        """
-        for segstart in idautils.Segments():
-            segname = idc.get_segm_name(segstart)
-            segend = idc.get_segm_end(segstart)
+        visitor.apply_to(cfunc.body, parent=None)
+        if not visitor.found:
 
-            # Filter the segments that we should process according to their name
-            if not (re.match('.*__mod_init_func', segname) or re.match('.*__kmod_init', segname)):
-                continue
+            # don't spam error logs for mod_init functions that are not related to global objects
+            if must_find_call:
+                self.log.error(f'Failed to find OSMetaClass::OSMetaClass call site in the ctree {ea:#x}')
+            return False
 
-            self.log(2, 'Processing segment {}', segname)
-            for func in idau.ReadWords(segstart, segend):
-                self._process_mod_init_func_for_metaclasses(func)
+        if not visitor.passed_ops_validation:
+            self.log.error(f'Failed ops validations! ops:[{", ".join(str(a.op) for a in visitor.args)}] {ea:#x}')
+            return False
 
-    def _process_mod_init_func_for_metaclasses(self, func):
-        """
-        Process a single function from the __mod_init_func section for OSMetaClass information.
-        """
-        self.log(4, 'Processing function {}', idc.get_func_name(func))
+        # Make sure that the classname is within a cstring section and then read its contents
+        classname_ea = visitor.args[1].obj_ea
+        if not re.match(r".*__(cstring|const)$", idc.get_segm_name(classname_ea)):
+            self.log.error(f'arg[1] does not belong in a __cstring/__const segment! ea:{ea:#x} classname_ea:{classname_ea:#x}')
+            return False
 
-        def on_BL(addr, reg):
-            X0, X1, X3 = reg['X0'], reg['X1'], reg['X3']
-            if not (X0 and X1 and X3):
-                return
-            self.log(5, 'Have call to {:#x}({:#x}, {:#x}, ?, {:#x})', addr, X0, X1, X3)
+        classname_str = idc.get_strlit_contents(classname_ea).decode()
+        classname_str_clean = symbol.clean_templated_name(classname_str)
+        metaclass_arg = decompiler.traverse_casts_or_ref_branch(visitor.args[0])
+        match metaclass_arg.op:
+            case ida_hexrays.cot_var:
 
-            # OSMetaClass::OSMetaClass(this, className, superclass, classSize)
-            if re.match(".*__cstring", idc.get_segm_name(X1)) and idc.get_segm_name(X0):
-                # Register this metaclass in the dictionary
-                self._found_metaclass(X0, idc.get_strlit_contents(X1).decode(), X3, reg['X2'] or None)
+                # Seems like there are a lot of useless constructors that are not used, we cannot find their corresponding
+                # metaclass because it is passed as a variable instead of a reference.
+                # Usually for those there will be some other valid xref to this classname. So the approach I took here is to
+                # only inform the user of these errors after finishing collecting from all possible sources
+                # Fail silently and only check later
+                self._var_expr_errors[classname_str_clean].add(ea)
+                return False
+            case ida_hexrays.cot_obj:
+                metaclass_ea = metaclass_arg.obj_ea
+            case _:
+                self.log.error(f'unexpected ctree structure arg[0] branch did not lead to cot_obj! ea:{ea:#x}')
+                return False
 
-        emulate_arm64(func, idc.find_func_end(func), on_BL=on_BL)
+        super_metaclass_arg = decompiler.traverse_casts_or_ref_branch(visitor.args[2])
+        match super_metaclass_arg.op:
+            case ida_hexrays.cot_num:
+                if super_metaclass_arg.numval():
+                    self.log.error(f'arg[2] is a non-zero numeric value! ea:{ea:#x}')
+                    return False
+                super_metaclass_ea = 0
+            case ida_hexrays.cot_obj:
+                super_metaclass_ea = super_metaclass_arg.obj_ea
+            case _:
+                self.log.error(f'unexpected ctree structure arg[0] branch did not lead to cot_obj! ea:{ea:#x}')
+                return False
 
+        # fourth argument is always cot_numval
+        class_size = visitor.args[3].numval()
 
-def get_call_from_expr(expr):
-    if expr.op == ida_hexrays.cot_cast:
-        expr = expr.x
-    if expr.op == ida_hexrays.cot_call:
-        return expr
-    return None
+        # We found valid information. record it
+        self.log.debug(f"Found metaclass info for {classname_str} at {ea:#x}")
 
-
-def get_call_from_insn(insn):
-    # TODO: move to ida_utilities.py
-    if type(insn) == ida_hexrays.cinsn_t and insn.op == ida_hexrays.cit_expr:
-        expr = insn.cexpr
-    elif type(insn) == ida_hexrays.cexpr_t:
-        expr = insn
-    else:
-        return None
-    if expr.op == ida_hexrays.cot_asg:
-        # For the form of: var = call(...)
-        call_asg_y = get_call_from_expr(expr.y)
-        if call_asg_y:
-            return call_asg_y
-        # For the form of: *call(...) = .... or call(...)->__vftable = ...
-        if expr.x.op == ida_hexrays.cot_ptr or expr.x.op == ida_hexrays.cot_memptr:
-            call_asg_x = get_call_from_expr(expr.x.x)
-            if call_asg_x:
-                return call_asg_x
-    else:
-        return get_call_from_expr(expr)
-    return None
-
-
-def dref_cast_and_ref_to_obj(expr, dref_obj=False):
-    found_ref = False
-    if expr.op == ida_hexrays.cot_cast:
-        expr = expr.x
-    if expr.op == ida_hexrays.cot_ref:
-        expr = expr.x
-        found_ref = True
-    if expr.op != ida_hexrays.cot_obj:
-        return None
-    if not found_ref and dref_obj:
-        return idau.read_ptr(expr.obj_ea)
-    return expr.obj_ea
+        self._metaclass_to_classname_builder.add_link(metaclass_ea, classname_str_clean)
+        self._metaclass_to_class_size[metaclass_ea] = class_size
+        self._metaclass_to_super_metaclass[metaclass_ea] = super_metaclass_ea
+        return True

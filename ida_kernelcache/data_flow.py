@@ -13,6 +13,7 @@ While it is possible to implement a very generic data flow framework, allowing c
 be implemented entirely externally and with little or no knowledge of the underlying architecture,
 this module does not take that approach, for reasons of simplicity and efficiency.
 
+TODO: can we use IDA hexrays Data flow analysis results? See /Applications/IDA Pro 8.4/idabin/plugins/hexrays_sdk/readme.txt
 """
 
 import collections

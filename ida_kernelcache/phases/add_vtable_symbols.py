@@ -6,6 +6,7 @@ from ida_kernelcache.symbol import vtable_symbol_for_class
 class AddVtableSymbols(BasePhase):
     """
     Populate IDA with virtual method table symbols for an iOS kernelcache.
+    TODO: this is still a work in progress!
     """
 
     def run(self):

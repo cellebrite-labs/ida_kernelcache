@@ -225,7 +225,7 @@ def global_name(name):
     return '__Z' + mangled
 
 
-def clean_templated_name(templated_name):
+def clean_templated_name(templated_name: str) -> str:
     # TODO: below is a hack fix to handle names of templates. We need a better way to handle them.
     # example "OSValueObject<void*>" -> "OSValueObject_voidP_"
     # also: iOS17b1 OSValueObject<OSKextRequestResourceCallback>::fields field on the struct: OSValueObject<OSKextRequestResourceCallback>

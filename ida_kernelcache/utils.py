@@ -1,6 +1,13 @@
 from collections import defaultdict
 
 
+def iterlen(iterator):
+    """
+    Consume an iterator and return its length.
+    """
+    return sum(1 for _ in iterator)
+
+
 class OneToOneMapFactory(object):
     """A factory to extract the largest one-to-one submap."""
 
