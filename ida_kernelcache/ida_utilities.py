@@ -7,6 +7,9 @@
 
 from collections import deque
 
+import os
+import sys
+import pathlib
 import idc
 import idautils
 import idaapi
@@ -15,6 +18,7 @@ import ida_bytes
 import ida_funcs
 import ida_name
 import ida_auto
+import ida_typeinf
 
 read_ptr = idaapi.get_qword if idaapi.get_inf_structure().is_64bit() else idaapi.get_dword
 
@@ -568,8 +572,27 @@ def struct_create(name, union=False):
     """Create an IDA struct with the given name, returning the SID."""
     # AddStrucEx is documented as returning -1 on failure, but in practice it seems to return
     # BADADDR.
-    union = 1 if union else 0
-    sid = idc.add_struc(-1, name, union)
+    til = ida_typeinf.get_idati()
+    ordinal = ida_typeinf.get_type_ordinal(til, name)
+    if ordinal in (0, -1, idc.BADADDR, ida_typeinf.BADORD):
+        union = 1 if union else 0
+        sid = idc.add_struc(-1, name, union)
+    else:
+        tif = ida_typeinf.tinfo_t()
+        tif.get_numbered_type(til, ordinal, ida_typeinf.BTF_UNION if union else ida_typeinf.BTF_STRUCT)
+        if tif.is_forward_decl():
+            # create a new struct/union tif:
+            udt = ida_typeinf.udt_type_data_t()
+            udt.name = name
+            udt.is_union = union
+            tif = ida_typeinf.tinfo_t()
+            tif.create_udt(udt)
+            # replace old ordinal with new struct:
+            tif.set_numbered_type(til, ordinal, ida_typeinf.NTF_REPLACE, name)
+            sid = ida_struct.get_struc_id(name)
+        else:
+            # type exists but is not a forward decl?
+            return None
     if sid in (-1, idc.BADADDR):
         return None
     return sid
@@ -627,3 +650,13 @@ def struct_add_struct(sid, name, offset, msid, count=1):
     size = ida_struct.get_struc_size(msid)
     return idc.add_struc_member(sid, name, offset, idc.FF_DATA | ida_bytes.FF_STRUCT, msid, size * count)
 
+def remove_typelibs():
+    """Iterate over all .til files amd attempt to remove them
+    """
+    til_dir = pathlib.Path(sys.executable).parent / "til"
+    for root, dirs, files in os.walk(til_dir):
+        for file in files:
+            if file.endswith(".til"):
+                til = os.path.splitext(file)[0]
+                ida_typeinf.del_til(til)
+    
