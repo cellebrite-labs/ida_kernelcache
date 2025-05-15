@@ -221,7 +221,7 @@ def initialize_vtable_structs():
 
 #### Classes based on struct slices ###############################################################
 
-def _create_class_structs__slices(classinfo, endmarkers=True):
+def _create_class_structs__slices(classinfo, endmarkers=False):
     """Create the IDA structs for a C++ class."""
     classname = classinfo.classname
     # Open or create the structs.
@@ -251,20 +251,30 @@ def _create_class_structs__slices(classinfo, endmarkers=True):
         fields_start = idau.WORD_SIZE
     fields_size = classinfo.class_size - fields_start
     # Add an ::end member to the fields struct if requested.
-    if endmarkers:
-        ret = idc.add_struc_member(sidf, classname + '::end', fields_size, idc.FF_UNK, -1, 0)
+    if endmarkers and fields_size > 0:
+        ret = idc.add_struc_member(sidf, classname + '::end', fields_size - 1, idc.FF_UNK, -1, 1)
         if ret not in (0, idc.STRUC_ERROR_MEMBER_NAME, idc.STRUC_ERROR_MEMBER_OFFSET):
             # If that didn't work that's too bad, but continue anyway.
             _log(0, 'Could not create {}::end', classname)
     return sid, sidf, fields_start
 
-def _populate_fields_struct__slices(sid, classinfo, fields_start, accesses):
+def _populate_fields_struct__slices(sid, classinfo, accesses, fields_start):
     """Fill in the members of the ::fields struct based on the accesses."""
     # Sanity check.
     for offset, size in accesses:
         assert fields_start <= offset <= offset + size <= classinfo.class_size
     # For each (offset, size) access, add a member to the struct.
     build_struct.create_struct_fields(sid, accesses=accesses, base=fields_start)
+    # Last member of ::fields struct is ::end.
+    # ::end is a zero-sized array, and this causes a lot of problems :P
+    # So we we make it padding instead...
+    struct_t = ida_struct.get_struc(sid)
+    fields_size = classinfo.class_size - fields_start    
+    last_member = struct_t.get_last_member()
+    offset = last_member.get_soff() + last_member.get_size() if last_member else 0
+    size = fields_size - offset            
+    if size > 0:
+        idc.add_struc_member(sid, classinfo.classname + '::end', offset, idc.FF_DATA | idc.FF_BYTE, -1, size)
 
 def _populate_wrapper_struct__slices(sid, classinfo):
     """Fill in the members of the wrapper struct."""
@@ -303,8 +313,8 @@ def _populate_wrapper_struct__slices(sid, classinfo):
 
 def _populate_class_structs__slices(classinfo, class_accesses, sid, sidf, fields_start):
     """Populate the IDA structs for a C++ class."""
-    _populate_fields_struct__slices(sidf, classinfo, fields_start,
-            class_accesses[classinfo.classname])
+    _populate_fields_struct__slices(sidf, classinfo, 
+                                    class_accesses[classinfo.classname], fields_start)
     _populate_wrapper_struct__slices(sid, classinfo)
 
 #### Classes based on unions ######################################################################
@@ -319,7 +329,7 @@ def _create_class_structs__unions(classinfo):
         return None
     return sid, sidf
 
-def _populate_fields_struct__unions(sid, classinfo, accesses):
+def _populate_fields_struct__unions(sid, classinfo, accesses, *args):
     """Fill in the members of the ::fields struct based on the accesses."""
     # Sanity check.
     for offset, size in accesses:
@@ -468,7 +478,8 @@ def _convert_operands_to_struct_offsets(access_addresses):
 
 def _set_class_style(style):
     """Set the global class style."""
-    global _style_was_set, _create_class_structs, _populate_class_structs
+    global _style_was_set, _create_class_structs, _populate_class_structs, \
+            _populate_fields_struct, _populate_wrapper_struct
     assert style in (CLASS_SLICES, CLASS_UNIONS)
     # Check the current style based on OSObject, a class that should always exist.
     sid = idau.struct_open('OSObject')
@@ -484,9 +495,13 @@ def _set_class_style(style):
     # Set the appropriate functions based on the style.
     if style == CLASS_SLICES:
         _create_class_structs   = _create_class_structs__slices
+        _populate_fields_struct = _populate_fields_struct__slices
+        _populate_wrapper_struct = _populate_wrapper_struct__slices
         _populate_class_structs = _populate_class_structs__slices
     else:
         _create_class_structs   = _create_class_structs__unions
+        _populate_fields_struct = _populate_fields_struct__unions
+        _populate_wrapper_struct = _populate_wrapper_struct__unions
         _populate_class_structs = _populate_class_structs__unions
 
 def process_functions(functions, style=DEFAULT_STYLE):
@@ -515,9 +530,14 @@ def process_functions(functions, style=DEFAULT_STYLE):
         data = _create_class_structs(classinfo)
         if data is not None:
             class_structs[classinfo] = data
-    # Populate the class's structs using the access tuples.
+    # Populate the class's fields structs using the access tuples.
     for classinfo, data in list(class_structs.items()):
-        _populate_class_structs(classinfo, class_accesses, *data)
+        _, sidf, fields_start = data
+        _populate_fields_struct(sidf, classinfo, class_accesses[classinfo.classname], fields_start)
+    # ...Then populate the wrapper structs
+    for classinfo, data in list(class_structs.items()):
+        sid, *_ = data
+        _populate_wrapper_struct(sid, classinfo)
     # Finally, convert each operand that generated an access into an appropriately typed struct
     # offset reference.
     _convert_operands_to_struct_offsets(class_operands)

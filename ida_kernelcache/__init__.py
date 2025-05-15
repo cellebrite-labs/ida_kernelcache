@@ -52,6 +52,8 @@ def kernelcache_process(untag_pointers=True):
         print('Processing tagged kernelcache pointers')
         tagged_pointers.untag_pointers()
         autoanalyze()
+    print('Removing type libraries')
+    ida_utilities.remove_typelibs()
     print('Initializing segments')
     segment.initialize_segments()
     print('Initializing data offsets')
