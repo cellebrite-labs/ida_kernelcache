@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=80", "wheel", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ida-kernelcache"
+dynamic = ["version"]
+description = "IDAPython module for analyzing iOS kernelcaches"
+
+[tool.setuptools]
+packages = ["ida_kernelcache"]
+
+[tool.setuptools_scm]

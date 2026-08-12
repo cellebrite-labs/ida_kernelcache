@@ -4,6 +4,16 @@
 
 This fork was updated to work on IDA 9.x / Python 3 / iOS 27.0 beta 1
 
+## Installation
+
+With [ida-setup](https://github.com/cellebrite-labs/ida-setup):
+
+```bash
+ida-setup pip install -e /path/to/ida-kernelcache
+```
+
+Or manually add the repository to your IDA Python path.
+
 ## Original Readme
 <!-- Brandon Azad -->
 
